@@ -1,0 +1,934 @@
+#!/usr/bin/perl -w
+#
+# A nagios plugin that monitors the MPT status for Sun XFire, or uses
+# MegaCli for Dell PowerEdge.
+# 
+# Espen Braastad, Linpro AS (2006)
+# Jonas Helgi Palsson, Redpill Linpro AS (2009)
+# Kjetil Torgrim Homme, Redpill Linpro AS (2010)
+#
+# Requirements:
+#  the mtp-status binary
+#  the mtpctl module
+#
+# OR
+#
+# MegaCli installed.
+# 
+# This script is intended to be run as root. So Nagios has to
+# be allowed to run it through sudo.
+
+
+use strict;
+use Data::Dumper;
+use Getopt::Long;
+use Time::HiRes qw(gettimeofday tv_interval);
+
+my $t0 = [gettimeofday];
+
+# Supported cards (we look in /sys/class/scsi_host/hostX/proc_name and
+# /proc/driver)
+
+my %driver_handler = 
+    (
+     aacraid      => \&check_aacraid,
+     cciss        => \&check_cciss,
+     hpsa         => \&check_cciss,
+     megaraid_sas => \&check_megaraid,
+     mptsas       => \&check_mptsas,
+     mptspi       => \&check_mptsas,
+     "3ware"      => \&check_tw_cli,
+     iomemory_vsl => \&check_fusionio,
+    );
+
+my %module_handler =
+    (
+     "3w_9xxx"    => "3ware"
+    );
+
+my %proc_handler =
+    (
+     "fusion"     => "iomemory_vsl",
+    );
+
+# Possible paths for the mpt-status program. Add more if necessary
+my $mpt_status = find_exec(
+    '/usr/sbin/mpt-status',
+    '/usr/local/sbin/mpt-status',
+    '/usr/local/bin/mpt-status',
+    );
+
+my $lsiutil = find_exec(
+    '/usr/local/sbin/lsiutil',
+    '/usr/sbin/lsiutil',
+    );
+
+my $megacli = find_exec(
+    '/usr/sbin/MegaCli',
+    '/opt/MegaRAID/MegaCli/MegaCli64',
+    '/opt/MegaRAID/MegaCli/MegaCli',
+    '/usr/local/sbin/MegaCli64',
+    );
+
+my $arcconf = find_exec(
+    '/usr/local/sbin/arcconf',
+    '/usr/sbin/arcconf',
+    '/usr/RaidMan/arcconf',
+    '/usr/StorMan/arcconf',
+    );
+
+my $hpacucli = find_exec(
+    '/usr/sbin/hpacucli',
+    );
+
+my $uname26 = find_exec(
+    '/bin/uname26',
+    '/usr/local/sbin/uname26',
+    );
+
+if (defined $uname26 && defined $hpacucli) {
+    $hpacucli = "$uname26 $hpacucli";
+}
+
+my $smartctl = find_exec(
+    '/usr/sbin/smartctl',
+    );
+
+my $tw_cli = find_exec(
+    '/usr/local/sbin/tw_cli',
+    '/usr/sbin/tw_cli',
+    );
+
+my $fio_status = find_exec(
+    '/usr/bin/fio-status',
+    );
+
+my $CRIT = 2;
+my $WARN = 1;
+my $OK   = 0;
+
+my $debug = 0;
+my $trace = 0;
+my $picky = 0;
+my $full = 0;
+
+GetOptions("debug|d" => \$debug,
+           "trace" => \$trace,
+           "full" => \$full,
+           "picky" => \$picky)
+    or die "Usage $0 [--debug] [--picky] [--trace] [--full]\n";
+
+my %smartctl_cache = ();
+
+# We always check for MD software RAID
+my @drives = check_md();
+
+my $installed_cards = check_cards();
+
+if (@drives == 0 && scalar keys %{$installed_cards} == 0) {
+# No cards found, is this critical? It might be, but we say it is normal...
+    print "Found neither software nor hardware RAID\n";
+    exit 0;
+}
+
+# do work
+for my $driver (keys %{$installed_cards}) {
+    my $adapter = 0;
+    my $previous;
+    for my $hostnum (sort { $a <=> $b } @{$installed_cards->{$driver}}) {
+
+        # Don't process the same card twice (if discovered with both /sys and /proc)
+        next if defined $previous && $hostnum == $previous;
+        $previous = $hostnum;
+
+        my @e = $driver_handler{$driver}->($adapter, $hostnum);
+
+        # Sanity check -- we may be misparse and not find anything at
+        # all.
+        if (@e == 0) {
+            my $okflag = "/etc/check_raid-no-disks-on-$driver$adapter";
+            my $oldflag = "/etc/no-disks-on-$driver$adapter";
+            if (-r $okflag || -r $oldflag) {
+                @e = ([$OK, "$driver$adapter: No disks found."]);
+            } else {
+                @e = ([$WARN, "$driver$adapter: No disks found.  ".
+                       "Touch $okflag if no disks will be attached"]);
+            }
+        } else {
+            if (! grep { $_->[1] =~ /^\S+ ld / } @e) {
+                my $ldflag = "/etc/check_raid-no-ld-on-$driver$adapter";
+                if (-r $ldflag) {
+                    push(@e, [$OK, "$driver$adapter: No logical drives"]);
+                } else {
+                    push(@e, [$WARN, "$driver$adapter: No logical drives ".
+                              "found.  Touch $ldflag if this is OK"]);
+                }
+            }
+        }
+        push(@drives, @e);
+        ++$adapter;
+    }
+}
+
+my @output = filter_report($CRIT, "CRITICAL", @drives);
+push(@output, filter_report($WARN, "WARNING", @drives));
+push(@output, filter_report($OK, "OK", @drives));
+
+my $output = join(", ", @output);
+print $output, "\n";
+
+if ($output =~ /^CRIT/) {
+    exit $CRIT;
+} elsif ($output =~ /^WARN/) {
+    exit $WARN;
+}
+
+exit $OK;
+
+###########################
+# Subrutines;
+###########################
+
+sub check_cards {
+    my $cards;
+
+    my %done;
+    for my $driver ("cciss") {
+        if (-d "/proc/driver/$driver") {
+            for my $file (</proc/driver/$driver/$driver*>) {
+                my ($number) = $file =~ m/(\d+)/;
+                $cards->{$driver} ||= ();
+                push(@{$cards->{$driver}}, $number);
+                $done{$driver} = 1;
+            }
+        }
+    }
+    for my $path (keys %proc_handler) {
+        if (-d "/proc/$path") {
+            my $driver = $proc_handler{$path};
+            unless ($done{$driver}) {
+                push(@{$cards->{$driver}}, 0);
+                $done{$driver} = 1;
+            }
+        }
+    }
+    for my $file (</sys/class/scsi_host/*/proc_name>) {
+        open(my $fh, $file);
+        my $driver = <$fh>;
+        close($fh);
+        chomp $driver;
+        next unless defined $driver_handler{$driver};
+        next if $done{$driver};
+        my ($number) = $file =~ m/(\d+)/;
+        $cards->{$driver} ||= ();
+        push(@{$cards->{$driver}}, $number);
+    }
+    my $lsmod = slurp("/sbin/lsmod");
+    for (@{$lsmod}) {
+        /(\S+)/;
+        if ($module_handler{$1}) {
+            $cards->{$module_handler{$1}} = [0];
+        }
+    }
+    return $cards;
+}
+
+sub find_exec {
+    for my $program (@_) {
+        return $program if -x $program;
+    }
+    return undef;
+}
+
+sub filter_report {
+    my ($level, $prefix, @lines) = @_;
+    @lines = map { "[$_->[1]]" } grep { $_->[0] == $level } @lines;
+    return @lines ? "$prefix: ".join(" ", sort @lines) : ();
+}
+
+sub check_md {
+    my ($md, $state, $ro, $raid, @device, $size, $present, $total, $recovery);
+    my @drives;
+    open(my $mdstat, "/proc/mdstat") || return ();
+    while (<$mdstat>) {
+        chomp;
+        if (/^(md\d+)\s*:\s*(\S+)\s*(?:\((auto-read-only|read-only)\)\s*)?(\S+)\s*(.*)/) {
+            ($md, $state, $ro, $raid) = ($1, $2, $3, $4);
+            # 'auto-read-only' means there has been no writes to the
+            # device yet, which is OK.
+            if ($ro && $ro eq "read-only") {
+                # This is probably bad, but don't overwrite other bad states.
+                if ($state eq "active") {
+                    $state = "read-only";
+                } else {
+                    $state .= "/read-only";
+                }
+            }
+            for my $comp (split(/\s+/, $5)) {
+                if ($comp =~ /^(\S+)\[(\d+)\](\([SWF]\))?$/) {
+                    my ($part, $slot) = ($1, $2);
+                    $device[$slot] = {
+                        part => $part,
+                        disk => $part,
+                        spare => defined $3 && $3 eq "(S)",
+                        faulty => defined $3 && $3 eq "(F)",
+                        # state W (write-mostly) can be silently ignored.
+                    };
+                    if ($part =~ /^([hs]d.*?)\d+$/ && -b "/dev/$1") {
+                        $device[$slot]->{disk} = $1;
+                    }
+                } else {
+                    push(@drives, [$WARN, "$md: can't parse $comp"]);
+                }
+            }
+        } elsif (m,^\s*(\d+) blocks.*? \[(\d+)/(\d+)\] \[(.*?)\],) {
+            ($size, $total, $present) = ($1, $2, $3);
+            for my $slot (0 .. $total-1) {
+                $device[$slot]->{status} = substr($4, $slot, 1);
+            }
+        } elsif (/^\[.*\] recovery = (\d+\.\d+)%/) {
+            $recovery = $1;
+        } elsif (/^\s*$/ && defined $md) {
+            my $md_status = defined $recovery ? $WARN : $OK;
+            $md_status = $CRIT if $present < $total;
+            $md_status = $CRIT if $state ne "active";
+            for my $slot (0 .. $#device) {
+                unless ($device[$slot]->{disk}) {
+                    push(@drives, [$CRIT, "$md phy component $slot MISSING"]);
+                    next;
+                }
+                my $smart = check_smartctl($device[$slot]->{disk});
+                my $phy_status = $OK;
+                $md_status = $WARN
+                    if $device[$slot]->{faulty} && $md_status eq $OK;
+                $phy_status = $CRIT unless ($smart->{health} eq "PASSED" ||
+                                            $smart->{health} eq "no-smartctl!" ||
+                                            $smart->{health} eq "pre-smart" ||
+                                            $smart->{health} eq "");
+                if ($device[$slot]->{spare}) {
+                    push(@drives, [$phy_status, "$md phy ".
+                                   $device[$slot]->{part}.
+                                   " ($smart->{model}) SPARE $smart->{health}"]);
+                } else {
+                    my $s = $device[$slot]->{status};
+                    if ($s eq "U") {
+                        $s = "OK";
+                    } elsif ($s eq "_") {
+                        $s = "MISSING";
+                    } else {
+                        $s = "BAD ($s)";
+                    }
+                    $phy_status = $CRIT if $s ne "OK";
+                    push(@drives, [$phy_status, "$md phy ".
+                                   $device[$slot]->{part}.
+                                   " ($smart->{model}) $s $smart->{health}"]);
+                }
+                $md_status = $phy_status if $phy_status > $md_status;
+            }
+            $size = sprintf("%d MiB", $size / 1024);
+            my $text = "$md ld [$total/$present] $size $state";
+            $text .= " resync $recovery" if $recovery;
+            push(@drives, [$md_status, $text]);
+            $md = $recovery = undef;
+        }
+    }
+    close($mdstat);
+    return @drives;
+}
+
+sub check_smartctl {
+    my ($disk) = @_;
+
+    return ("", "") unless defined $disk;
+    return $smartctl_cache{$disk} if defined $smartctl_cache{$disk};
+
+    return({ health => "no-smartctl!", model => "" })
+        unless defined $smartctl;
+
+    open(my $sm, "$smartctl -T conservative -i -H /dev/$disk|")
+        or die "$smartctl /dev/$disk: $!\n";
+    my %info = (health => "pre-smart",
+                model => "parsefail",
+                size => "? MiB");
+    while (<$sm>) {
+        chomp;
+        # RedHat
+        if (/^\s*Device Model:\s*(.*)/) {
+            $info{model} = $1;
+        } elsif (/^\s*User Capacity:\s*([\d,.]+) bytes/) {
+            my $bytes = $1;
+            $bytes =~ s/\D//g;
+            $info{size} = sprintf("%d MiB", $bytes/1024/1024);
+        } elsif (/^SMART overall-health.*:\s+(.*)/) {
+            $info{health} = $1;  # "PASSED"
+        }
+        # Debian/Ubuntu
+        elsif (/^Device:\s*(?:\S+)\s+(.*?)\s+Version:/) {
+            $info{model} = $1;
+        }
+        # Ubuntu Precise
+        elsif (/^Product:\s*(\S+)/) {
+            $info{model} = $1;
+        } elsif (/^SMART Health Status:\s*(.*)/) {
+            # map to output like on RHEL
+            $info{health} = $1 eq "OK" ? "PASSED" : $1;
+        } # no size in output
+    }
+    close($sm);
+    my $s = $? >> 8;
+    if ($? == 0) {
+        # hunky dory
+    } elsif ($s == 2) {
+        $info{health} = "smartctl-open-failed";
+    } elsif ($s == 4) {
+        # exit status 4 (bit 2) means some SMART command failed,
+        # probably due to being an old device.  ignore.
+    } else {
+        $info{health} = "smartctl-fail-$s";
+    }
+    $smartctl_cache{$disk} = \%info;
+    return \%info;
+}
+
+sub check_megaraid {
+    my ($adapter, $host) = @_;
+
+    return [$CRIT, "MegaCli not found"] unless defined $megacli;
+
+    my @drives;
+    my ($virt, $num, $name, $size, $state, $status, $errors);
+    
+    my @cmd;
+    push(@cmd, $uname26) if $uname26;
+    push(@cmd, $megacli, "-LdPdInfo", "-a$adapter", "-NoLog");
+
+    my $m = slurp(@cmd);
+    return [$CRIT, "megaraid$adapter: $m"] unless ref $m;
+    for (@{$m}) {
+        chomp;
+        if (/^Virtual (?:Disk|Drive):\s*(\d+)/) {
+            $virt = "ld";
+            $num = $1;
+        } elsif (/^Name\s*:\s*(.*)/) {
+            $name = $1;
+        } elsif (/^Size\s*:\s*(.*)/) {
+            $size = $1;
+        } elsif (/^State\s*:\s*(.*)/) {
+            $state = $1;
+            $status = $state eq "Optimal" ? $OK : $CRIT;
+        } elsif (/^Media Error Count\s*:\s*(\d+)/) {
+            $errors = $1;
+        } elsif (/^Other Error Count\s*:\s*(\d+)/) {
+            $errors += $1;
+        } elsif (/^Predictive Failure Count\s*:\s*(\d+)/) {
+            # TBD: probably wrong to flag this as an error.
+            $errors += $1;
+        } elsif (/^Enclosure Number\*:\s*(\d+)/) {
+            $virt = "phy";
+            $num = "e$1";
+        } elsif (/^Slot Number:\s*(\d+)/) {
+            $name = "slot $1";
+        } elsif (/^Coerced Size:\s*(\S*)/) {
+            $size = $1;
+        } elsif (/^Firmware state:\s*(.*)/) {
+            $state = $1;
+            $status = $state =~ /^Online(, Spun Up)?/ ? $OK : $CRIT;
+        } elsif (/^PD:\s+(\d+)/) {
+            my $pd = $1;
+            if (defined $virt) {
+                push_megaraid_state(\@drives, $adapter, $virt, $num, $name, $size, $state, $status, $errors);
+                $virt = $name = undef;
+            }
+            if ($pd) {
+                $virt = "phy";
+                $num = "e$pd";
+            }
+        } elsif (/^(?:\s*$|PD:)/ && defined $virt) {
+            push_megaraid_state(\@drives, $adapter, $virt, $num, $name, $size, $state, $status, $errors);
+            $virt = $name = undef;
+        }
+    }
+    return @drives;
+}
+
+sub push_megaraid_state {
+    my ($drives, $adapter, $virt, $num, $name, $size, $state, $status, $errors) = (@_);
+
+    my $text = "megaraid$adapter: $virt $num ($name) $size $state";
+    if ($errors) {
+        # TODO: a state file with known error counts
+        $status = $WARN unless $status == $CRIT;
+        $text .= " $errors errors";
+    }
+    push(@{$drives}, [$status, $text]);
+}
+
+
+sub check_mptsas {
+    system("/sbin/modprobe mptctl") unless -c "/dev/mptctl";
+
+    return [$OK, "mptsas$_[0] ld - Controller unused"]
+        if -e "/etc/check_raid-ignore-mptsas$_[0]";
+    return check_lsiutil(@_) if defined $lsiutil;
+    return check_mpt_status(@_);
+}
+
+sub check_lsiutil {
+    my ($adapter, $host) = @_;
+
+    my @drives;
+
+    my $port = $adapter + 1;
+
+    open(my $cmd, "printf '8\\n' | $lsiutil -p $port|")
+        or return [$CRIT,  "mptsas$adapter $lsiutil -p $port: $!"];
+
+    my $direct_attach = 0;
+    my $raid_attach = 0;
+    while (<$cmd>) {
+        chomp;
+        if (/^\s*\d+\s+\d+\s+\d+\s+Disk\s+(\S+)\s+(.{16})\s+(\S+)\s*(.*)/) {
+            my ($vendor, $rev, $phys) = ($1, $2, $3);
+            # We assume that "VIRTUAL DISK", "Logical Volume" and similar
+            # will never have a SASAddress and PhyNum
+            ++$direct_attach if $phys ne "";
+        } elsif (/^\s*\d+\s+\d+\s+PhysDisk\s+(\d+)\s+(\S+)\s+(.{16})\s+(\S+)\s*(\S+)\s+(\S+)/) {
+            # The matching lines will be under the heading "Hidden
+            # RAID Devices"
+            my ($vendor, $rev, $sas, $phynum) = ($1, $2, $3, $4);
+            ++$raid_attach;
+        }
+    }
+    close($cmd);
+
+    unless ($raid_attach) {
+        # We don't use this controller for RAID
+        return ([$OK, "mptsas$adapter: ld - No logical drives defined"]);
+    }
+
+    open($cmd, "printf '21\\n1\\n' | $lsiutil -p $port|")
+        or return [$CRIT, "mptsas$adapter $lsiutil -p $port: $!"];
+    my ($num, $name, $size, $state);
+    while (<$cmd>) {
+        chomp;
+        if (/^Volume (\d+)/) {
+            $num = $1;
+        } elsif (/^\s*Volume Name:\s*(.*)/) {
+            $name = $1;
+        } elsif (/^\s*Volume State:\s*(.*)/) {
+            $state = $1;
+        } elsif (/^\s*Volume Size (\d+ \w+)/) {
+            $size = $1;
+        } elsif (/^\s*$/ && defined $num) {
+            my $text = "mptsas$adapter ld $num ($name) $size $state";
+            my $status = $state eq "optimal, enabled" ? $OK : $CRIT;
+            push(@drives, [$status, $text]);
+            $num = undef;
+        }
+    }
+    close($cmd);
+    open($cmd, "printf '21\\n2\\n' | $lsiutil -p $port|")
+        or return [$CRIT, "mptsas$adapter $lsiutil -p $port: $!"];
+    $num = undef;
+    while (<$cmd>) {
+        chomp;
+        if (/^PhysDisk (\d+) is Bus (\d+) Target (\d+)/) {
+            $num = $1; $name = "bus $2 target $3";
+        } elsif (/^\s*PhysDisk State:\s*(.*)/) {
+            $state = $1;
+        } elsif (/^\s*PhysDisk Size\s+(\d+ \w+),/) {
+            $size = $1;
+        } elsif (/^\s*$/ && defined $num) {
+            my $text = "mptsas$adapter phy $num ($name) $size $state";
+            my $status = $state eq "online" ? $OK : $CRIT;
+            push(@drives, [$status, $text]);
+            $num = $name = undef;
+        }
+    }
+    close($cmd);
+
+    return(@drives);
+}
+    
+sub check_mpt_status {
+    my ($adapter, $host) = @_;
+
+    return [$CRIT, "mpt-status not found"]
+        unless defined $mpt_status;
+    my @drives;
+    # Not sure if this should be $adapter or $host ...
+    my $output = `$mpt_status -u $adapter -p`;
+    if ($output =~ /Nothing found/) {
+        my $okflag = "/etc/no-disks-on-mptsas$adapter";
+        return ([$OK, "mptsas$adapter: no disks"])
+            if -r $okflag;
+        return ([$CRIT, "mptsas$adapter: No disks found.  ".
+                 "Please install lsiutil or ".
+                 "touch $okflag if this controller will stay unused"]);
+    } elsif ($output !~ /Found/) {
+        return ([$WARN, "Unexpected output from $mpt_status -u $adapter, ".
+                 "modprobe mptctl?"]);
+    }
+
+    while ($output =~ /Found SCSI id=(\d+)/g) {
+        push(@drives, check_mpt_set($adapter, $1));
+    }
+    return @drives;
+}
+
+sub check_mpt_set {
+    my ($adapter, $set_id) = @_;
+    my @drives;
+
+    my %mpt_states = (
+        MISSING           => $CRIT,
+        NOT_COMPATIBLE    => $CRIT,
+        FAILED            => $CRIT,
+        OFFLINE_REQUESTED => $CRIT,
+        FAILED_REQUESTED  => $CRIT,
+        OTHER_OFFLINE     => $CRIT,
+        UNKNOWN           => $CRIT,
+        DEGRADED          => $CRIT,
+        INITIALIZING      => $WARN,
+        OPTIMAL           => $OK,
+        ONLINE            => $OK,
+        );
+
+    my %mpt_flags = (
+        OUT_OF_SYNC        => $CRIT,
+        QUIESCED           => $CRIT,
+        RESYNC_IN_PROGRESS => $WARN,
+        NONE               => $OK,
+        ENABLED            => $OK,
+        );
+
+    my $cmd = slurp($mpt_status, "-u", $adapter, "-i", $set_id);
+    return [$CRIT, "mptsas$adapter $cmd"] unless ref $cmd;
+    for (@{$cmd}) {
+        if (/^\S+ vol_id (\d+) .*\d+ phy, (\d+ \w+), state (\w+), flags (\w+)/) {
+            my ($vol, $size, $state, $flags) = ($1, $2, $3, $4);
+            my $status = $mpt_states{$state};
+            $status = $CRIT unless defined $mpt_states{$state};
+            $status = $CRIT unless defined $mpt_flags{$flags};
+            $status = $mpt_flags{$flags} if $mpt_flags{$flags} > $status;
+
+            my $text = "mptsas$adapter ld $vol ($size) $state";
+            $text .= "/$flags" unless $flags eq "ENABLED";
+
+            push(@drives, [$status, $text]);
+        } elsif (/^\S+ phy (\d+) .*?, (\d+ \w+), state (\S+), flags (\S+)/) {
+            my ($phy, $size, $state, $flags) = ($1, $2, $3, $4);
+            my $status = $mpt_states{$state};
+            $status = $CRIT unless defined $mpt_states{$state};
+            $status = $CRIT unless defined $mpt_flags{$flags};
+            $status = $mpt_flags{$flags} if $mpt_flags{$flags} > $status;
+
+            my $text = "mptsas$adapter phy $phy ($size) $state";
+            $text .= "/$flags" unless $flags eq "NONE";
+
+            push(@drives, [$status, $text]);
+        }
+    }
+    return @drives;
+}
+
+sub check_aacraid {
+    my ($adapter, $host) = @_;
+
+    return [$CRIT, "aacraid$adapter arcconf not found"]
+        unless defined $arcconf;
+
+    my $ctrl = $adapter + 1;
+    my @drives;
+    my ($num, $name, $size, $state);
+    my ($battstatus, $batttemp, $battcap);
+    my $section = "";
+    my $cmd = slurp($arcconf, "GETCONFIG", $ctrl, "al");
+    return [$CRIT, "aacraid$adapter $cmd"] unless ref $cmd;
+    for (@{$cmd}) {
+        chomp;
+        if (/^([A-Z].*) information$/) {
+            $section = $1;
+            $section =~ s/\s+(device|drive)//i;
+            $num = 0;
+        # ------------------------------------------------------------
+        # Controller information
+        # ------------------------------------------------------------
+        } elsif (/^\s*Controller Status\s*:\s*(.*)/) {
+            $state = $1;
+            ++$num;
+        } elsif (/^\s*Controller Serial Number\s*:\s*(.*)/) {
+            $name = $1;
+        } elsif (/^\s*Status\s*:\s*(.*)/) {
+            $battstatus = $1;
+        } elsif (/^\s*Over temperature\s*:\s*(.*)/) {
+            $batttemp = $1;
+        } elsif (/^\s*Capacity remaining\s*:\s*(\d+)/) {
+            $battcap = $1;
+        } elsif ($section eq "Controller" && /^\s*$/ && $name) {
+            my $battery = "battery $battstatus";
+            $battery .= " $battcap%" if $battcap;
+            my $status = ($state eq "Okay" || $state eq "Optimal") ?
+                $OK : $CRIT;
+            if ($batttemp && $batttemp ne "No") {
+                $battery .= " (HOT)";
+                $status = $WARN if $status == $OK;
+            }
+            if ($battstatus eq "Okay" || $battstatus eq "Optimal") {
+                # good
+            } elsif ($battstatus eq "Charging") {
+                if ($battcap < 25) {
+                    $status = $CRIT;
+                } elsif ($battcap < 50 && $status != $CRIT) {
+                    $status = $WARN;
+                }
+            } else {
+                $status = $CRIT;
+            }
+
+            my $text = "aacraid$adapter c$num (serial $name) $state ($battery)";
+            push(@drives, [$status, $text]);
+            $name = undef;
+        # ------------------------------------------------------------
+        # Logical device information
+        # ------------------------------------------------------------
+        } elsif (/Logical (?:drive|device) number (\d+)/) {
+            $num = $1;
+        } elsif (/Logical (?:drive|device) name\s+:\s*(.*)/) {
+            $name = $1;
+        } elsif (/No logical devices configured/) {
+            $num = undef;
+        } elsif (/RAID level\s*:\s*(.*)/) {
+            my $raid = $1;
+            if ($name =~ /^Device \d+/) {
+                # the RAID level is more interesting than a generic name
+                $name = "RAID $raid";
+            }
+        } elsif (/Status of logical (?:drive|device)\s+:\s*(.*)/) {
+            $state = $1;
+        } elsif (/Size\s*:\s*(\d+ \S+)/) {
+            $size = $1;
+        } elsif ($section eq "Logical" && /^\s*$/ && defined $num) {
+            my $text = "aacraid$adapter ld $num ($name) $size $state";
+            my $status = $CRIT;
+            $status = $OK if $state =~ /^(Okay|Optimal)$/;
+            # "Impacted" during initialisation
+            # "Suboptimal, Fault Tolerant" while resyncing a single disk in RAID6
+            $status = $WARN if $state =~ /^(Impacted|Suboptimal, Fault Tolerant)/i;
+            push(@drives, [$status, $text]);
+            $num = undef;
+        # ------------------------------------------------------------
+        # Physical device information
+        # ------------------------------------------------------------
+        } elsif (/No physical drives attached/) {
+            $num = undef;
+        } elsif (/Device #(\d+)/) {
+            $num = $1;
+        } elsif (/S\.M\.A\.R\.T\.\s+:\s*(\S+)/) {
+            if ($1 ne 'No') {
+                push(@drives, [$WARN,
+                               "aacraid$adapter pd$num S.M.A.R.T alert $1"])
+                    if $picky;
+            }
+        }
+    }
+
+    # Get rid of annoying log file (if owned by us and modified within
+    # last 15 minutes)
+    unlink("UcliEvt.log") if -f "UcliEvt.log" && -O _ && -M _ < 0.01;
+
+    return @drives;
+}
+
+
+# Returns a ref to an array or an error message
+sub slurp {
+    my $t1;
+    my $ret;
+    if ($trace) {
+        $t1 = [gettimeofday];
+        printf("%9.6f run: %s\n", tv_interval($t0, $t1), $_[0]);
+    }
+    if (open(my $fd, "-|", @_)) {
+        my @lines = <$fd>;
+        close($fd);
+        $ret = \@lines;
+    } else {
+        $ret = "$_[0]: $!";
+    }
+    if ($trace) {
+        my $t2 = [gettimeofday];
+        printf("%9.6f end %9.6f elapsed: %s\n",
+               tv_interval($t0, $t2), tv_interval($t1, $t2), $_[0]);
+    }
+    return $ret;
+}
+
+# Special case code due to retries :-p
+sub slurp_hpacucli {
+    my ($args, $attempts) = @_;
+
+    my $t1;
+    if ($trace) {
+        $t1 = [gettimeofday];
+        printf("%9.6f run: %s  (attempt %d)\n", tv_interval($t0, $t1),
+               "hpacucli $args", $attempts || 0);
+    }
+    
+    open(my $cmd, "$hpacucli $args|")
+        or return;
+    my @lines;
+    while (<$cmd>) {
+        if (/Another instance of hpacucli is running/) {
+            close($cmd);
+            if (++$attempts < 3) {
+                print STDERR "hpacucli running, sleeping 1 second and retrying\n"
+                    if $debug;
+                sleep(1);
+                return slurp_hpacucli($args, $attempts);
+            }
+            print STDERR "hpacucli running, too bad\n" if $debug;
+            return;
+        }
+        chomp;
+        push(@lines, $_);
+    }
+    close($cmd);
+    if ($trace) {
+        my $t2 = [gettimeofday];
+        printf("%9.6f end %9.6f elapsed: %s\n",
+               tv_interval($t0, $t2), tv_interval($t1, $t2), "hpacucli $args");
+    }
+    return @lines;
+}
+    
+sub check_cciss {
+    my ($adapter, $host) = @_;
+
+    return [$CRIT, "cciss$adapter hpacucli not found, install package from HP"]
+        unless defined $hpacucli;
+
+    my $slot = cciss_slot($adapter);
+
+    return [$CRIT, "cciss$adapter could not find slot"]
+        if $slot == -1;
+
+    my @drives;
+    my $any_problems = 0;
+
+    for (slurp_hpacucli("ctrl slot=$slot logicaldrive all show")) {
+        if (/logicaldrive (\d+) \((.*) RAID (.+?), (.*)\)$/) {
+            my $text = "cciss$adapter ld $1 (RAID $3) $2 $4";
+            my $status = $CRIT;
+            $status = $OK if $4 eq "OK";
+            $status = $WARN if $4 =~ /Recovering/;
+            push(@drives, [$status, $text]);
+            ++$any_problems if $status != $OK;
+        }
+    }
+
+    if ($any_problems || $full) {
+        for (slurp_hpacucli("ctrl slot=$slot physicaldrive all show")) {
+            if (/physicaldrive (.*) \(port \S+:box \d+:bay \d+, \S+, (\d+ \S+), (.*)\)/) {
+                my $text = "cciss$adapter phy $1 ($2) $3";
+                my $status = $CRIT;
+                $status = $WARN if $3 eq "Rebuilding";
+                $status = $OK if $3 =~ /^OK(, spare)?$/;
+                push(@drives, [$status, $text]);
+            }
+        }
+    }
+
+    return @drives;
+}
+
+sub cciss_slot {
+    my ($adapter) = @_;
+
+    return "0" unless defined $hpacucli;
+    my $count = 0;
+    my $slot = -1;
+    my @output = slurp_hpacucli("ctrl all show status");
+    for (@output) {
+        if (/^Smart.* in Slot (\d+)/) {
+            if ($count == $adapter) {
+                $slot = $1;
+                last;
+            }
+            ++$count;
+        }
+    }
+    if ($slot == -1 && $debug) {
+        print STDERR ("No controllers found, couldn't parse ",
+                      "'hpacucli ctrl all show status':\n");
+        print STDERR join("\n", @output), "\n";
+    }
+    return $slot;
+}
+
+sub check_tw_cli {
+    my ($adapter, $host) = @_;
+    return [$CRIT, "tw_cli not found"]
+        unless defined $tw_cli;
+
+    my @drives;
+    my %ctrl;
+    my $cmd = slurp($tw_cli, "show");
+    return [$CRIT, "3ware-$adapter $cmd"] unless ref $cmd;
+    foreach (@{$cmd}) {
+        chomp;
+        if (/^(c\d+)\s+(.+?)(?:\s+(?:\d+)){6}\s+(?:\S+)/) {
+            $ctrl{$1} = $2;
+        }
+    }
+    for my $c (sort keys %ctrl) {
+        $cmd = slurp($tw_cli, "/$c", "show");
+        unless (ref $cmd) {
+            push(@drives, [$CRIT, "3ware-$c $cmd"]);
+            next;
+        }
+        foreach (@{$cmd}) {
+            chomp;
+            if (/^(u\d+)\s+(\S+)\s+(\S+)\s+\S+\s+\S+\s+(\d+\.\d+)/) {
+                my $text = "3ware-$c ld $1 ($2) $4 GB $3";
+                my $status = $3 eq "OK" ? $OK : $CRIT;
+                push(@drives, [$status, $text]);
+            }
+            if (/^(p\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\s\S+)\s+(?:\d+)\s+(\S+)/) {
+                my $text = "3ware-$c phy $3:$1 ($5) $4 $2";
+                my $status = $2 eq "OK" ? $OK : $CRIT;
+                push(@drives, [$status, $text]);
+            }
+        }
+    }
+    return @drives;
+}
+
+sub check_fusionio {
+    return [$CRIT, "fio-status not found"]
+        unless defined $fio_status;
+    my $cmd = slurp($fio_status);
+    return [$CRIT, "fusionio $cmd"] unless ref $cmd;
+    my $num_drives = 0;
+    my ($dev, $name, $size);
+    my (@drives);
+    foreach (@{$cmd}) {
+        if (/^Found (\d+) ioDrive/) {
+            $num_drives = $1;
+        } elsif (/^(f\S+).* as '(\S*)'/) {
+            $dev = $1;
+            $name = $2;
+            $size = undef;
+        } elsif (/(\d+\.\d+ ..)\S* block device size/) {
+            $size = $1;
+        } elsif (/Media status: (.*); Reserves: (\d+.*?%),/) {
+            my $status = $1 eq 'Healthy' ? $OK : $CRIT;
+            push(@drives, [$status, "fusionio ld $dev ($name) $size $1 ($2 res)"]);
+            $dev = undef;
+        }
+    }
+    if (scalar @drives != $num_drives) {
+        push(@drives, [$WARN, "fio Could not parse fio_status accurately"]);
+    }
+    return @drives;
+}
